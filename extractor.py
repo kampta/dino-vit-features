@@ -157,6 +157,22 @@ class ViTExtractor:
         prep_img = prep(pil_image)[None, ...]
         return prep_img, pil_image
 
+    def preprocess_pil(self, pil_image):
+        """
+        Preprocesses an image before extraction.
+        :param image_path: path to image to be extracted.
+        :param load_size: optional. Size to resize image before the rest of preprocessing.
+        :return: a tuple containing:
+                    (1) the preprocessed image as a tensor to insert the model of shape BxCxHxW.
+                    (2) the pil image in relevant dimensions
+        """
+        prep = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=self.mean, std=self.std)
+        ])
+        prep_img = prep(pil_image)[None, ...]
+        return prep_img
+
     def _get_hook(self, facet: str):
         """
         generate a hook method for a specific block and facet.
