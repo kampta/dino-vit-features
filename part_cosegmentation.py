@@ -240,7 +240,6 @@ def parts_from_feat(extractor, layer, facet, bin, transform,
         # common_part_num_labels = np.max(common_part_labels) + 1
         # parts_num_descriptors_per_image = [np.count_nonzero(mask) for mask in common_parts_masks]
         # common_part_labels_per_image = np.split(common_part_labels, np.cumsum(parts_num_descriptors_per_image))
-        import ipdb; ipdb.set_trace()
         # get smoothed parts using crf
         common_part_segmentations = []
         for _, img, descs in zip(image_paths,  images_list, descriptors_list):

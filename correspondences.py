@@ -46,7 +46,6 @@ def corrs_from_feat(
     fg_mask2 = mask2.resize((num_patches, num_patches), resample=Image.LANCZOS)
     fg_mask2 = torch.from_numpy(np.array(fg_mask2).reshape(-1)).to(device)
 
-    import ipdb; ipdb.set_trace()
     # calculate similarity between image1 and image2 descriptors
     # similarities = chunk_cosine_sim(descriptors1.unsqueeze(0).unsqueeze(0),
     #                                 descriptors2.unsqueeze(0).unsqueeze(0))
