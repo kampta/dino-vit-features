@@ -227,6 +227,9 @@ class ViTExtractor:
         self.num_patches = (1 + (H - self.p) // self.stride[0], 1 + (W - self.p) // self.stride[1])
         return self._feats
 
+    def get_num_patches(self, H, W):
+        return (1 + (H - self.p) // self.stride[0], 1 + (W - self.p) // self.stride[1])
+
     def _log_bin(self, x: torch.Tensor, hierarchy: int = 2) -> torch.Tensor:
         """
         create a log-binned descriptor.

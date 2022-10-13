@@ -36,96 +36,73 @@ def kmeans_correspondences(descriptors1, descriptors2, ranks, num_pairs):
 
 
 def corrs_from_feat(
-        extractor, img1: torch.Tensor, img2: torch.Tensor,
-        descriptors1: torch.Tensor, descriptors2: torch.Tensor,
-        mask1: torch.Tensor, mask2: torch.Tensor, num_pairs: int = 10) -> \
-        Tuple[List[Tuple[float, float]],
-              List[Tuple[float, float]], Image.Image, Image.Image]:
-    """
-    finding point correspondences between two images.
-    :param image_path1: path to the first image.
-    :param image_path2: path to the second image.
-    :param num_pairs: number of outputted corresponding pairs.
-    :param load_size: size of the smaller edge of loaded images.
-                      If None, does not resize.
-    :param layer: layer to extract descriptors from.
-    :param facet: facet to extract descriptors from.
-    :param bin: if True use a log-binning descriptor.
-    :param thresh: threshold of saliency maps to distinguish fg and bg.
-    :param model_type: type of model to extract descriptors from.
-    :param stride: stride of the model.
-    :return: list of points from image_path1,
-             list of corresponding points from image_path2
-    """
-    # extracting descriptors for each image
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    num_patches1 = num_patches2 = extractor.num_patches
+        descriptors1, descriptors2, mask1, mask2, saliency_map1, saliency_map2,
+        num_patches, stride, p, device):
 
-    # interpolate masks
-    fg_mask1 = F.interpolate(
-        mask1.unsqueeze(0).unsqueeze(0), num_patches1, mode='bilinear')
-    fg_mask1 = (fg_mask1.squeeze() > 0.5).reshape(-1)
-    fg_mask2 = F.interpolate(
-        mask2.unsqueeze(0).unsqueeze(0), num_patches2, mode='bilinear')
-    fg_mask2 = (fg_mask2.squeeze() > 0.5).reshape(-1)
+    # Resizing masks
+    fg_mask1 = mask1.resize((num_patches, num_patches), resample=Image.LANCZOS)
+    fg_mask1 = torch.from_numpy(np.array(fg_mask1).reshape(-1)).to(device)
 
-    # extracting saliency maps for each image
-    saliency_map1 = extractor.extract_saliency_maps(img1)[0]
-    saliency_map2 = extractor.extract_saliency_maps(img2)[0]
+    fg_mask2 = mask2.resize((num_patches, num_patches), resample=Image.LANCZOS)
+    fg_mask2 = torch.from_numpy(np.array(fg_mask2).reshape(-1)).to(device)
 
+    import ipdb; ipdb.set_trace()
     # calculate similarity between image1 and image2 descriptors
-    similarities = chunk_cosine_sim(descriptors1, descriptors2)
+    # similarities = chunk_cosine_sim(descriptors1.unsqueeze(0).unsqueeze(0),
+    #                                 descriptors2.unsqueeze(0).unsqueeze(0))
+    similarities = F.normalize(descriptors1, dim=1) @ F.normalize(descriptors2, dim=1).T
 
     # calculate best buddies
-    image_idxs = torch.arange(num_patches1[0] * num_patches1[1], device=device)
-    sim_1, nn_1 = torch.max(similarities, dim=-1)  # nn_1 - indices of block2 closest to block1
-    sim_2, nn_2 = torch.max(similarities, dim=-2)  # nn_2 - indices of block1 closest to block2
-    sim_1, nn_1 = sim_1[0, 0], nn_1[0, 0]
-    sim_2, nn_2 = sim_2[0, 0], nn_2[0, 0]
+    image_idxs = torch.arange(num_patches * num_patches, device=device)
+    # nn_1 - indices of block2 closest to block1
+    sim_1, nn_1 = torch.max(similarities, dim=-1)
+    # nn_2 - indices of block1 closest to block2
+    sim_2, nn_2 = torch.max(similarities, dim=-2)
+    # sim_1, nn_1 = sim_1[0, 0], nn_1[0, 0]
+    # sim_2, nn_2 = sim_2[0, 0], nn_2[0, 0]
     bbs_mask = nn_2[nn_1] == image_idxs
 
     # remove best buddies where at least one descriptor is marked bg by saliency mask.
     fg_mask2_new_coors = nn_2[fg_mask2]
-    fg_mask2_mask_new_coors = torch.zeros(num_patches1[0] * num_patches1[1], dtype=torch.bool, device=device)
+    fg_mask2_mask_new_coors = torch.zeros(num_patches * num_patches, dtype=torch.bool, device=device)
     fg_mask2_mask_new_coors[fg_mask2_new_coors] = True
     bbs_mask = torch.bitwise_and(bbs_mask, fg_mask1)
     bbs_mask = torch.bitwise_and(bbs_mask, fg_mask2_mask_new_coors)
+    bbs_mask = bbs_mask.cpu().numpy()
 
     # rank pairs by their mean saliency value
-    bb_cls_attn1 = saliency_map1[bbs_mask]
-    bb_cls_attn2 = saliency_map2[nn_1[bbs_mask]]
+    bbs_mask_idx1 = np.where(bbs_mask)[0]
+    bbs_mask_idx2 = nn_1[bbs_mask].cpu().numpy()
+    bb_cls_attn1 = saliency_map1[bbs_mask_idx1]
+    bb_cls_attn2 = saliency_map2[bbs_mask_idx2]
     bb_cls_attn = (bb_cls_attn1 + bb_cls_attn2) / 2
-    ranks = bb_cls_attn
-    ranks_sim = sim_1[bbs_mask]
+    ranks_sal = bb_cls_attn
+    ranks_sim = sim_1[bbs_mask_idx1]
 
-    kmeans_indices = kmeans_correspondences(
-        descriptors1[0, 0, bbs_mask, :].cpu().numpy(),
-        descriptors2[0, 0, nn_1[bbs_mask], :].cpu().numpy(),
-        ranks, num_pairs)
+    # kmeans_indices = kmeans_correspondences(
+    #     descriptors1[0, 0, bbs_mask, :].cpu().numpy(),
+    #     descriptors2[0, 0, nn_1[bbs_mask], :].cpu().numpy(),
+    #     ranks, num_pairs)
 
     # applying k-means to extract k high quality well distributed
     # correspondence pairs
 
     # get coordinates to show
     img1_bb = torch.arange(
-        num_patches1[0] * num_patches1[1], device=device)[bbs_mask]
+        num_patches * num_patches, device=device)[bbs_mask_idx1]
     img2_bb = nn_1[img1_bb]
     # coordinates in descriptor map's dimensions
-    img1_bb_y = (img1_bb / num_patches1[1]).long()
-    img1_bb_x = (img1_bb % num_patches1[1])
-    img2_bb_y = (img2_bb / num_patches2[1]).long()
-    img2_bb_x = (img2_bb % num_patches2[1])
+    img1_bb_y = (img1_bb / num_patches).long()
+    img1_bb_x = (img1_bb % num_patches)
+    img2_bb_y = (img2_bb / num_patches).long()
+    img2_bb_x = (img2_bb % num_patches)
     pt1 = torch.zeros(len(img1_bb), 2, dtype=torch.long)
     pt2 = torch.zeros(len(img1_bb), 2, dtype=torch.long)
-    pt1[:, 0] = (img1_bb_y - 1) * extractor.stride[0] + extractor.stride[0] \
-        + extractor.p // 2
-    pt1[:, 1] = (img1_bb_x - 1) * extractor.stride[1] + extractor.stride[1] \
-        + extractor.p // 2
-    pt2[:, 0] = (img2_bb_y - 1) * extractor.stride[0] + extractor.stride[0] \
-        + extractor.p // 2
-    pt2[:, 1] = (img2_bb_x - 1) * extractor.stride[1] + extractor.stride[1] \
-        + extractor.p // 2
-    return pt1, pt2, ranks, ranks_sim, kmeans_indices
+    pt1[:, 1] = (img1_bb_y - 1) * stride + stride + p // 2
+    pt1[:, 0] = (img1_bb_x - 1) * stride + stride + p // 2
+    pt2[:, 1] = (img2_bb_y - 1) * stride + stride + p // 2
+    pt2[:, 0] = (img2_bb_x - 1) * stride + stride + p // 2
+    return pt1, pt2, bbs_mask_idx1, bbs_mask_idx2, ranks_sal, ranks_sim
 
 
 def find_correspondences(image_path1: str, image_path2: str, num_pairs: int = 10, load_size: int = 224, layer: int = 9,

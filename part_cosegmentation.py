@@ -1,10 +1,12 @@
 import argparse
+from tkinter import N
 import torch
 from pathlib import Path
 
 import torchvision.transforms
 from torchvision import transforms
-from extractor import ViTExtractor
+import torch.nn.functional as F
+from .extractor import ViTExtractor
 from tqdm import tqdm
 import numpy as np
 import faiss
@@ -13,6 +15,282 @@ import matplotlib.pyplot as plt
 from typing import List, Tuple
 import pydensecrf.densecrf as dcrf
 from matplotlib.colors import ListedColormap
+
+
+def create_augmentations(extractor, layer, facet, bin, transform, images_list,
+                         load_size, num_crop_augmentations, device):
+    print("Creating augmentations")
+    new_images_list = []
+    descriptors_list = []
+    saliency_maps_list = []
+
+    # crop_size = (int(load_size * 0.95), int(load_size * 0.95))
+    transform_pre = transforms.RandomResizedCrop(load_size, scale=(0.9, 1.0))
+    transform_post = transforms.Compose([
+        transforms.ToTensor(),
+        transform
+    ])
+    for image in tqdm(images_list):
+        image_pil = Image.fromarray(image)
+        flipped_image_pil = image_pil.transpose(Image.FLIP_LEFT_RIGHT)
+        for i in range(num_crop_augmentations):
+            image_t = transform_pre(image_pil)
+            new_images_list.append(np.array(image_t))
+
+            img_norm = transform_post(image_t).unsqueeze(0).to(device)
+            feat = extractor.extract_descriptors(img_norm, layer, facet, bin)
+            feat = feat.cpu().squeeze().numpy()
+            descriptors_list.append(feat)
+
+            saliency_map = extractor.extract_saliency_maps(img_norm)
+            saliency_map = saliency_map.squeeze().cpu().numpy()
+            saliency_maps_list.append(saliency_map)
+
+            image_t = transform_pre(flipped_image_pil)
+            new_images_list.append(np.array(image_t))
+            img_norm = transform_post(image_t).unsqueeze(0).to(device)
+            feat = extractor.extract_descriptors(img_norm, layer, facet, bin)
+            feat = feat.cpu().squeeze().numpy()
+            descriptors_list.append(feat)
+
+            saliency_map = extractor.extract_saliency_maps(img_norm)
+            saliency_map = saliency_map.squeeze().cpu().numpy()
+            saliency_maps_list.append(saliency_map)
+
+    return new_images_list, descriptors_list, saliency_maps_list
+
+
+def parts_from_feat(extractor, layer, facet, bin, transform,
+        descriptors_list, saliency_maps_list, images_list, image_paths,
+        load_size, device, elbow: float = 0.975, thresh: float = 0.065,
+        votes_percentage: int = 75, sample_interval: int = 100,
+        num_parts: int = 4, num_crop_augmentations: int = 0,
+        three_stages: bool = False, elbow_second_stage: float = 0.94,
+        save_dir:Path = Path('')):
+
+    new_images_list, aug_descriptors_list, aug_saliency_maps_list = \
+        create_augmentations(
+            extractor, layer, facet, bin, transform, images_list,
+            load_size, num_crop_augmentations, device)
+
+    images_list += new_images_list
+    descriptors_list += aug_descriptors_list
+    saliency_maps_list += aug_saliency_maps_list
+    num_patches = extractor.get_num_patches(load_size, load_size)[0]
+    num_images = len(image_paths)
+
+    print("Clustering all images using k-means")
+    all_descriptors = np.ascontiguousarray(np.concatenate(descriptors_list, axis=0))
+    normalized_all_descriptors = all_descriptors.astype(np.float32)
+    faiss.normalize_L2(normalized_all_descriptors)  # in-place operation
+    sampled_descriptors_list = [x[::sample_interval, :] for x in descriptors_list]
+    all_sampled_descriptors = np.ascontiguousarray(np.concatenate(sampled_descriptors_list, axis=0))
+    normalized_all_sampled_descriptors = all_sampled_descriptors.astype(np.float32)
+    faiss.normalize_L2(normalized_all_sampled_descriptors)  # in-place operation
+
+    sum_of_squared_dists = []
+    n_cluster_range = list(range(1, 15))
+    for n_clusters in n_cluster_range:
+        algorithm = faiss.Kmeans(d=normalized_all_sampled_descriptors.shape[1], k=n_clusters, niter=300, nredo=10)
+        algorithm.train(normalized_all_sampled_descriptors.astype(np.float32))
+        squared_distances, labels = algorithm.index.search(normalized_all_descriptors.astype(np.float32), 1)
+        objective = squared_distances.sum()
+        sum_of_squared_dists.append(objective / normalized_all_descriptors.shape[0])
+        if (len(sum_of_squared_dists) > 1 and sum_of_squared_dists[-1] > elbow * sum_of_squared_dists[-2]):
+            break
+
+    num_labels = np.max(n_clusters) + 1
+    num_descriptors_per_image = [num_patches*num_patches] * len(images_list)
+    labels_per_image = np.split(labels, np.cumsum(num_descriptors_per_image)[:-1])
+
+    if save_dir is not None:
+        cmap = 'jet' if num_labels > 10 else 'tab10'
+        for path, label_per_image in zip(image_paths, labels_per_image):
+            fname = save_dir / f'parts_s1_num{num_labels}_{Path(path).stem}.npy'
+            np.save(fname, label_per_image.reshape(num_patches, num_patches))
+            fname = save_dir / f'parts_s1_num{num_labels}_{Path(path).stem}.png'
+            fig, ax = plt.subplots()
+            ax.axis('off')
+            ax.imshow(label_per_image.reshape((num_patches, num_patches)), vmin=0,
+                      vmax=num_labels-1, cmap=cmap)
+            fig.savefig(fname, bbox_inches='tight', pad_inches=0)
+            plt.close(fig)
+
+    print("Using saliency maps to vote for salient clusters (only original images vote, not augmentations")
+    votes = np.zeros(num_labels)
+    # for image, image_labels, saliency_map in zip(images_list, labels_per_image, saliency_maps_list):
+    for img_idx in range(num_images):
+        for label in range(num_labels):
+            label_saliency = saliency_maps_list[img_idx][labels_per_image[img_idx][:, 0] == label].mean()
+            if label_saliency > thresh:
+                votes[label] += 1
+    salient_labels = np.where(votes >= np.ceil(num_images * votes_percentage / 100))[0]
+
+    print("Clustering all parts using k-means")
+    fg_masks = [np.isin(labels, salient_labels) for labels in labels_per_image]  # get only foreground descriptors
+    fg_descriptor_list = [desc[fg_mask[:, 0], :] for fg_mask, desc in zip(fg_masks, descriptors_list)]
+    all_fg_descriptors = np.ascontiguousarray(np.concatenate(fg_descriptor_list, axis=0))
+    normalized_all_fg_descriptors = all_fg_descriptors.astype(np.float32)
+    faiss.normalize_L2(normalized_all_fg_descriptors)  # in-place operation
+    sampled_fg_descriptors_list = [x[::sample_interval, :] for x in fg_descriptor_list]
+    all_fg_sampled_descriptors = np.ascontiguousarray(np.concatenate(sampled_fg_descriptors_list, axis=0))
+    normalized_all_fg_sampled_descriptors = all_fg_sampled_descriptors.astype(np.float32)
+    faiss.normalize_L2(normalized_all_fg_sampled_descriptors)  # in-place operation
+
+    sum_of_squared_dists = []
+    # if applying three stages, use elbow to determine number of clusters in second stage, otherwise use the specified
+    # number of parts.
+    n_cluster_range = list(range(1, 15)) if three_stages else [num_parts]
+    for n_clusters in n_cluster_range:
+        part_algorithm = faiss.Kmeans(d=normalized_all_fg_sampled_descriptors.shape[1], k=n_clusters, niter=300, nredo=10)
+        part_algorithm.train(normalized_all_fg_sampled_descriptors.astype(np.float32))
+        squared_distances, part_labels = part_algorithm.index.search(normalized_all_fg_descriptors.astype(np.float32), 1)
+        objective = squared_distances.sum()
+        sum_of_squared_dists.append(objective / normalized_all_fg_descriptors.shape[0])
+        if (len(sum_of_squared_dists) > 1 and sum_of_squared_dists[-1] > elbow_second_stage * sum_of_squared_dists[-2]):
+            break
+
+    part_num_labels = np.max(part_labels) + 1
+    # parts_num_descriptors_per_image = [np.count_nonzero(mask) for mask in fg_masks]
+    # part_labels_per_image = np.split(part_labels, np.cumsum(parts_num_descriptors_per_image))
+
+    print("Get smoothed parts using crf")
+    part_segmentations = []
+    for img, descs in zip(images_list, descriptors_list):
+        bg_centroids = tuple(i for i in range(algorithm.centroids.shape[0]) if not i in salient_labels)
+        curr_normalized_descs = descs.astype(np.float32)
+        faiss.normalize_L2(curr_normalized_descs)  # in-place operation
+        # distance to parts
+        dist_to_parts = ((curr_normalized_descs[:, None, :] - part_algorithm.centroids[None, ...]) ** 2
+                         ).sum(axis=2)
+        # dist to BG
+        dist_to_bg = ((curr_normalized_descs[:, None, :] - algorithm.centroids[None, bg_centroids, :]) ** 2
+                      ).sum(axis=2)
+        min_dist_to_bg = np.min(dist_to_bg, axis=1)[:, None]
+        d_to_cent = np.concatenate((dist_to_parts, min_dist_to_bg), axis=1).reshape(num_patches, num_patches,
+                                                                                    part_num_labels + 1)
+        d_to_cent = d_to_cent - np.max(d_to_cent, axis=-1)[..., None]
+        upsample = torch.nn.Upsample(size=(load_size, load_size))
+        u = np.array(upsample(torch.from_numpy(d_to_cent).permute(2, 0, 1)[None, ...])[0].permute(1, 2, 0))
+        d = dcrf.DenseCRF2D(u.shape[1], u.shape[0], u.shape[2])
+        d.setUnaryEnergy(np.ascontiguousarray(u.reshape(-1, u.shape[-1]).T))
+        compat = [50, 15]
+        d.addPairwiseGaussian(sxy=(3, 3), compat=compat[0], kernel=dcrf.DIAG_KERNEL,
+                              normalization=dcrf.NORMALIZE_SYMMETRIC)
+        d.addPairwiseBilateral(sxy=5, srgb=13, rgbim=img, compat=compat[1], kernel=dcrf.DIAG_KERNEL,
+                               normalization=dcrf.NORMALIZE_SYMMETRIC)
+        Q = d.inference(10)
+        final = np.argmax(Q, axis=0).reshape((load_size, load_size))
+        parts_float = final.astype(np.float32)
+        parts_float[parts_float == part_num_labels] = np.nan
+        part_segmentations.append(parts_float)
+
+    if save_dir is not None:
+        part_figs = draw_part_cosegmentation(part_num_labels, part_segmentations[:num_images], images_list[:num_images])
+        for path, part_fig, segmentation in zip(image_paths, part_figs, part_segmentations):
+            fname = save_dir / f'parts_s2_num{part_num_labels}_{Path(path).stem}.npy'
+            np.save(fname, segmentation)
+            fname = save_dir / f'parts_s2_num{part_num_labels}_{Path(path).stem}.png'
+            part_fig.savefig(fname, bbox_inches='tight', pad_inches=0)
+        plt.close('all')
+
+    print("Applying third stage")
+    if three_stages:  # if needed, apply third stage
+
+        # get labels after crf for each descriptor
+        smoothed_part_labels_per_image = []
+        for part_segment in part_segmentations:
+            resized_part_segment = np.array(F.interpolate(
+                torch.from_numpy(part_segment)[None, None, ...],
+                size=num_patches, mode='nearest')[0, 0])
+            smoothed_part_labels_per_image.append(resized_part_segment.flatten())
+
+        # take only parts that appear in all original images (otherwise they belong to non-common objects)
+        votes = np.zeros(part_num_labels)
+        # for _, image_labels in zip(images_list, smoothed_part_labels_per_image):
+        for img_idx in range(num_images):
+            image_labels = smoothed_part_labels_per_image[img_idx]
+            unique_labels = np.unique(image_labels[~np.isnan(image_labels)]).astype(np.int32)
+            votes[unique_labels] += 1
+        common_labels = np.where(votes == num_images)[0]
+
+        # get labels after crf for each descriptor
+        common_parts_masks = []
+        for part_segment in smoothed_part_labels_per_image:
+            common_parts_masks.append(np.isin(part_segment, common_labels).flatten())
+
+        # cluster all final parts using k-means:
+        common_descriptor_list = [desc[mask, :] for mask, desc in zip(common_parts_masks, descriptors_list)]
+        all_common_descriptors = np.ascontiguousarray(np.concatenate(common_descriptor_list, axis=0))
+        normalized_all_common_descriptors = all_common_descriptors.astype(np.float32)
+        faiss.normalize_L2(normalized_all_common_descriptors)  # in-place operation
+        sampled_common_descriptors_list = [x[::sample_interval, :] for x in common_descriptor_list]
+        all_common_sampled_descriptors = np.ascontiguousarray(np.concatenate(sampled_common_descriptors_list,
+                                                                             axis=0))
+        normalized_all_common_sampled_descriptors = all_common_sampled_descriptors.astype(np.float32)
+        faiss.normalize_L2(normalized_all_common_sampled_descriptors)  # in-place operation
+        if num_parts is None:
+            num_parts = part_num_labels
+        common_part_algorithm = faiss.Kmeans(
+            d=normalized_all_common_sampled_descriptors.shape[1], k=int(num_parts),
+            niter=300, nredo=10)
+        common_part_algorithm.train(normalized_all_common_sampled_descriptors)
+        # _, common_part_labels = common_part_algorithm.index.search(normalized_all_common_descriptors.astype(np.float32), 1)
+
+        # common_part_num_labels = np.max(common_part_labels) + 1
+        # parts_num_descriptors_per_image = [np.count_nonzero(mask) for mask in common_parts_masks]
+        # common_part_labels_per_image = np.split(common_part_labels, np.cumsum(parts_num_descriptors_per_image))
+        import ipdb; ipdb.set_trace()
+        # get smoothed parts using crf
+        common_part_segmentations = []
+        for _, img, descs in zip(image_paths,  images_list, descriptors_list):
+            bg_centroids_1 = tuple(i for i in range(algorithm.centroids.shape[0]) if not i in salient_labels)
+            bg_centroids_2 = tuple(i for i in range(part_algorithm.centroids.shape[0]) if not i in common_labels)
+            curr_normalized_descs = descs.astype(np.float32)
+            faiss.normalize_L2(curr_normalized_descs)  # in-place operation
+
+            # distance to parts
+            dist_to_parts = ((curr_normalized_descs[:, None, :] - common_part_algorithm.centroids[None, ...]) ** 2).sum(
+                axis=2)
+            # dist to BG
+            dist_to_bg_1 = ((curr_normalized_descs[:, None, :] -
+                             algorithm.centroids[None, bg_centroids_1, :]) ** 2).sum(axis=2)
+            dist_to_bg_2 = ((curr_normalized_descs[:, None, :] -
+                             part_algorithm.centroids[None, bg_centroids_2, :]) ** 2).sum(axis=2)
+            dist_to_bg = np.concatenate((dist_to_bg_1, dist_to_bg_2), axis=1)
+            min_dist_to_bg = np.min(dist_to_bg, axis=1)[:, None]
+            d_to_cent = np.concatenate((dist_to_parts, min_dist_to_bg), axis=1).reshape(num_patches, num_patches,
+                                                                                        num_parts + 1)
+            d_to_cent = d_to_cent - np.max(d_to_cent, axis=-1)[..., None]
+            upsample = torch.nn.Upsample(size=(load_size, load_size))
+            u = np.array(upsample(torch.from_numpy(d_to_cent).permute(2, 0, 1)[None, ...])[0].permute(1, 2, 0))
+            d = dcrf.DenseCRF2D(u.shape[1], u.shape[0], u.shape[2])
+            d.setUnaryEnergy(np.ascontiguousarray(u.reshape(-1, u.shape[-1]).T))
+
+            compat = [50, 15]
+            d.addPairwiseGaussian(sxy=(3, 3), compat=compat[0], kernel=dcrf.DIAG_KERNEL,
+                                  normalization=dcrf.NORMALIZE_SYMMETRIC)
+            d.addPairwiseBilateral(sxy=5, srgb=13, rgbim=np.array(img), compat=compat[1], kernel=dcrf.DIAG_KERNEL,
+                                   normalization=dcrf.NORMALIZE_SYMMETRIC)
+            Q = d.inference(10)
+            final = np.argmax(Q, axis=0).reshape((load_size, load_size))
+            common_parts_float = final.astype(np.float32)
+            common_parts_float[common_parts_float == num_parts] = np.nan
+            common_part_segmentations.append(common_parts_float)
+
+        # reassign third stage results as final results
+        part_segmentations = common_part_segmentations
+
+        if save_dir is not None:
+            part_figs = draw_part_cosegmentation(part_num_labels, part_segmentations[:num_images], images_list[:num_images])
+            for path, part_fig, segmentation in zip(image_paths, part_figs, part_segmentations):
+                fname = save_dir / f'parts_s3_{Path(path).stem}.npy'
+                np.save(fname, segmentation)
+                fname = save_dir / f'parts_s3_{Path(path).stem}.png'
+                part_fig.savefig(fname, bbox_inches='tight', pad_inches=0)
+            plt.close('all')
+
+    return part_segmentations
 
 
 def find_part_cosegmentation(image_paths: List[str], elbow: float = 0.975, load_size: int = 224, layer: int = 11,

@@ -2,7 +2,7 @@ import argparse
 import torch
 from pathlib import Path
 from torchvision import transforms
-from extractor import ViTExtractor
+from .extractor import ViTExtractor
 from tqdm import tqdm
 import numpy as np
 import faiss
@@ -10,6 +10,75 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import cv2
 from typing import List, Tuple
+
+
+def coseg_from_feat(
+        images_list, descriptors_list, saliency_maps_list, img_size, num_patches,
+        elbow: float = 0.975, thresh: float = 0.065, votes_percentage: int = 75,
+        sample_interval: int = 100):
+
+    num_images = len(images_list)
+    print("Cluster all images using k-means")
+    all_descriptors = np.ascontiguousarray(np.concatenate(descriptors_list)).copy()
+    # normalized_all_descriptors = all_descriptors.astype(np.float32)
+    faiss.normalize_L2(all_descriptors)  # in-place operation
+    sampled_descriptors_list = [x[::sample_interval] for x in descriptors_list]
+    all_sampled_descriptors = np.ascontiguousarray(np.concatenate(sampled_descriptors_list)).copy()
+    # normalized_all_sampled_descriptors = all_sampled_descriptors.astype(np.float32)
+    faiss.normalize_L2(all_sampled_descriptors)  # in-place operation
+
+    sum_of_squared_dists = []
+    n_cluster_range = list(range(1, 15))
+    for n_clusters in n_cluster_range:
+        algorithm = faiss.Kmeans(d=all_sampled_descriptors.shape[1], k=n_clusters, niter=300, nredo=10)
+        algorithm.train(all_sampled_descriptors)
+        squared_distances, labels = algorithm.index.search(all_descriptors, 1)
+        objective = squared_distances.sum()
+        sum_of_squared_dists.append(objective / all_descriptors.shape[0])
+        if (len(sum_of_squared_dists) > 1 and sum_of_squared_dists[-1] > elbow * sum_of_squared_dists[-2]):
+            break
+
+    num_labels = np.max(n_clusters) + 1
+    num_descriptors_per_image = [num_patches * num_patches] * num_images
+    labels_per_image = np.split(labels, np.cumsum(num_descriptors_per_image))
+
+    print("Use saliency maps to vote for salient clusters")
+    votes = np.zeros(num_labels)
+    for image_labels, saliency_map in zip(labels_per_image, saliency_maps_list):
+        for label in range(num_labels):
+            label_saliency = saliency_map[image_labels[:, 0] == label].mean()
+            if label_saliency > thresh:
+                votes[label] += 1
+    salient_labels = np.where(votes >= np.ceil(num_images * votes_percentage / 100))
+
+    print("Create masks using the salient labels")
+    segmentation_masks = []
+    for img, labels in zip(images_list, labels_per_image):
+        mask = np.isin(labels, salient_labels).reshape(num_patches, num_patches)
+        resized_mask = np.array(Image.fromarray(mask).resize((img_size, img_size), resample=Image.LANCZOS))
+        try:
+            # apply grabcut on mask
+            grabcut_kernel_size = (7, 7)
+            kernel = np.ones(grabcut_kernel_size, np.uint8)
+            forground_mask = cv2.erode(np.uint8(resized_mask), kernel)
+            forground_mask = np.array(Image.fromarray(forground_mask).resize(img.size, Image.NEAREST))
+            background_mask = cv2.erode(np.uint8(1 - resized_mask), kernel)
+            background_mask = np.array(Image.fromarray(background_mask).resize(img.size, Image.NEAREST))
+            full_mask = np.ones((load_size[0], load_size[1]), np.uint8) * cv2.GC_PR_FGD
+            full_mask[background_mask == 1] = cv2.GC_BGD
+            full_mask[forground_mask == 1] = cv2.GC_FGD
+            bgdModel = np.zeros((1, 65), np.float64)
+            fgdModel = np.zeros((1, 65), np.float64)
+            cv2.grabCut(np.array(img), full_mask, None, bgdModel, fgdModel, 5, cv2.GC_INIT_WITH_MASK)
+            grabcut_mask = np.where((full_mask == 2) | (full_mask == 0), 0, 1).astype('uint8')
+        except Exception:
+            # if mask is unfitted from gb (e.g. all zeros) -- don't apply it
+            grabcut_mask = resized_mask.astype('uint8')
+
+        grabcut_mask = Image.fromarray(np.array(grabcut_mask, dtype=bool))
+        segmentation_masks.append(grabcut_mask)
+
+    return segmentation_masks
 
 
 def find_cosegmentation(image_paths: List[str], elbow: float = 0.975, load_size: int = 224, layer: int = 11,
