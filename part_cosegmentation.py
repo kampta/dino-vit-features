@@ -229,7 +229,7 @@ def parts_from_feat(extractor, layer, facet, bin, transform,
                                                                              axis=0))
         normalized_all_common_sampled_descriptors = all_common_sampled_descriptors.astype(np.float32)
         faiss.normalize_L2(normalized_all_common_sampled_descriptors)  # in-place operation
-        if num_parts is None:
+        if num_parts is None or num_parts <=0:
             num_parts = part_num_labels
         common_part_algorithm = faiss.Kmeans(
             d=normalized_all_common_sampled_descriptors.shape[1], k=int(num_parts),
