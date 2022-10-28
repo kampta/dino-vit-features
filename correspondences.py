@@ -36,15 +36,8 @@ def kmeans_correspondences(descriptors1, descriptors2, ranks, num_pairs):
 
 
 def corrs_from_feat(
-        descriptors1, descriptors2, mask1, mask2, saliency_map1, saliency_map2,
-        num_patches, stride, p, device):
-
-    # Resizing masks
-    fg_mask1 = mask1.resize((num_patches, num_patches), resample=Image.LANCZOS)
-    fg_mask1 = torch.from_numpy(np.array(fg_mask1).reshape(-1)).to(device)
-
-    fg_mask2 = mask2.resize((num_patches, num_patches), resample=Image.LANCZOS)
-    fg_mask2 = torch.from_numpy(np.array(fg_mask2).reshape(-1)).to(device)
+        descriptors1, descriptors2, saliency_map1, saliency_map2,
+        num_patches, stride, p, device, mask1=None, mask2=None):
 
     # calculate similarity between image1 and image2 descriptors
     # similarities = chunk_cosine_sim(descriptors1.unsqueeze(0).unsqueeze(0),
@@ -61,12 +54,20 @@ def corrs_from_feat(
     # sim_2, nn_2 = sim_2[0, 0], nn_2[0, 0]
     bbs_mask = nn_2[nn_1] == image_idxs
 
-    # remove best buddies where at least one descriptor is marked bg by saliency mask.
-    fg_mask2_new_coors = nn_2[fg_mask2]
-    fg_mask2_mask_new_coors = torch.zeros(num_patches * num_patches, dtype=torch.bool, device=device)
-    fg_mask2_mask_new_coors[fg_mask2_new_coors] = True
-    bbs_mask = torch.bitwise_and(bbs_mask, fg_mask1)
-    bbs_mask = torch.bitwise_and(bbs_mask, fg_mask2_mask_new_coors)
+    # remove best buddies where at least one descriptor is marked bg
+    # by saliency mask
+    if mask1 is not None and mask2 is not None:
+        mask1 = mask1.resize((num_patches, num_patches), resample=Image.LANCZOS)
+        mask1 = torch.from_numpy(np.array(mask1).reshape(-1)).to(device)>0
+
+        mask2 = mask2.resize((num_patches, num_patches), resample=Image.LANCZOS)
+        mask2 = torch.from_numpy(np.array(mask2).reshape(-1)).to(device)>0
+
+        fg_mask2_new_coors = nn_2[mask2]
+        fg_mask2_mask_new_coors = torch.zeros(num_patches * num_patches, dtype=torch.bool, device=device)
+        fg_mask2_mask_new_coors[fg_mask2_new_coors] = True
+        bbs_mask = torch.bitwise_and(bbs_mask, mask1)
+        bbs_mask = torch.bitwise_and(bbs_mask, fg_mask2_mask_new_coors)
     bbs_mask = bbs_mask.cpu().numpy()
 
     # rank pairs by their mean saliency value
@@ -77,14 +78,6 @@ def corrs_from_feat(
     bb_cls_attn = (bb_cls_attn1 + bb_cls_attn2) / 2
     ranks_sal = bb_cls_attn
     ranks_sim = sim_1[bbs_mask_idx1]
-
-    # kmeans_indices = kmeans_correspondences(
-    #     descriptors1[0, 0, bbs_mask, :].cpu().numpy(),
-    #     descriptors2[0, 0, nn_1[bbs_mask], :].cpu().numpy(),
-    #     ranks, num_pairs)
-
-    # applying k-means to extract k high quality well distributed
-    # correspondence pairs
 
     # get coordinates to show
     img1_bb = torch.arange(

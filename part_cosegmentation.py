@@ -22,7 +22,7 @@ def create_augmentations(extractor, layer, facet, bin, transform, images_list,
     print("Creating augmentations")
     new_images_list = []
     descriptors_list = []
-    saliency_maps_list = []
+    # saliency_maps_list = []
 
     # crop_size = (int(load_size * 0.95), int(load_size * 0.95))
     transform_pre = transforms.RandomResizedCrop(load_size, scale=(0.9, 1.0))
@@ -42,9 +42,9 @@ def create_augmentations(extractor, layer, facet, bin, transform, images_list,
             feat = feat.cpu().squeeze().numpy()
             descriptors_list.append(feat)
 
-            saliency_map = extractor.extract_saliency_maps(img_norm)
-            saliency_map = saliency_map.squeeze().cpu().numpy()
-            saliency_maps_list.append(saliency_map)
+            # saliency_map = extractor.extract_saliency_maps(img_norm)
+            # saliency_map = saliency_map.squeeze().cpu().numpy()
+            # saliency_maps_list.append(saliency_map)
 
             image_t = transform_pre(flipped_image_pil)
             new_images_list.append(np.array(image_t))
@@ -53,11 +53,11 @@ def create_augmentations(extractor, layer, facet, bin, transform, images_list,
             feat = feat.cpu().squeeze().numpy()
             descriptors_list.append(feat)
 
-            saliency_map = extractor.extract_saliency_maps(img_norm)
-            saliency_map = saliency_map.squeeze().cpu().numpy()
-            saliency_maps_list.append(saliency_map)
+            # saliency_map = extractor.extract_saliency_maps(img_norm)
+            # saliency_map = saliency_map.squeeze().cpu().numpy()
+            # saliency_maps_list.append(saliency_map)
 
-    return new_images_list, descriptors_list, saliency_maps_list
+    return new_images_list, descriptors_list  # , saliency_maps_list
 
 
 def parts_from_feat(extractor, layer, facet, bin, transform,
@@ -68,14 +68,14 @@ def parts_from_feat(extractor, layer, facet, bin, transform,
         three_stages: bool = False, elbow_second_stage: float = 0.94,
         save_dir:Path = Path('')):
 
-    new_images_list, aug_descriptors_list, aug_saliency_maps_list = \
+    new_images_list, aug_descriptors_list = \
         create_augmentations(
             extractor, layer, facet, bin, transform, images_list,
             load_size, num_crop_augmentations, device)
 
     images_list += new_images_list
     descriptors_list += aug_descriptors_list
-    saliency_maps_list += aug_saliency_maps_list
+    # saliency_maps_list += aug_saliency_maps_list
     num_patches = extractor.get_num_patches(load_size, load_size)[0]
     num_images = len(image_paths)
 
@@ -188,14 +188,14 @@ def parts_from_feat(extractor, layer, facet, bin, transform,
     if save_dir is not None:
         part_figs = draw_part_cosegmentation(part_num_labels, part_segmentations[:num_images], images_list[:num_images])
         for path, part_fig, segmentation in zip(image_paths, part_figs, part_segmentations):
-            fname = save_dir / f'parts_s2_num{part_num_labels}_{Path(path).stem}.npy'
+            fname = save_dir / f'parts_s2_{Path(path).stem}.npy'
             np.save(fname, segmentation)
-            fname = save_dir / f'parts_s2_num{part_num_labels}_{Path(path).stem}.png'
+            fname = save_dir / f'parts_s2_{Path(path).stem}.png'
             part_fig.savefig(fname, bbox_inches='tight', pad_inches=0)
         plt.close('all')
 
-    print("Applying third stage")
     if three_stages:  # if needed, apply third stage
+        print("Applying third stage")
 
         # get labels after crf for each descriptor
         smoothed_part_labels_per_image = []
