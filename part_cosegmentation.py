@@ -177,7 +177,8 @@ def parts_from_feat(extractor, layer, facet, bin, transform,
         compat = [50, 15]
         d.addPairwiseGaussian(sxy=(3, 3), compat=compat[0], kernel=dcrf.DIAG_KERNEL,
                               normalization=dcrf.NORMALIZE_SYMMETRIC)
-        d.addPairwiseBilateral(sxy=5, srgb=13, rgbim=img, compat=compat[1], kernel=dcrf.DIAG_KERNEL,
+        d.addPairwiseBilateral(sxy=5, srgb=13, rgbim=np.ascontiguousarray(img),
+                               compat=compat[1], kernel=dcrf.DIAG_KERNEL,
                                normalization=dcrf.NORMALIZE_SYMMETRIC)
         Q = d.inference(10)
         final = np.argmax(Q, axis=0).reshape((load_size, load_size))
