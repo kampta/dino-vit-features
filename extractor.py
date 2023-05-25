@@ -43,7 +43,10 @@ class ViTExtractor:
         self.model = ViTExtractor.patch_vit_resolution(self.model, stride=stride)
         self.model.eval()
         self.model.to(self.device)
-        self.p = self.model.patch_embed.patch_size
+        patch_size = self.model.patch_embed.patch_size
+        if type(patch_size) == tuple:
+            patch_size = patch_size[0]
+        self.p = patch_size
         self.stride = self.model.patch_embed.proj.stride
 
         self.mean = (0.485, 0.456, 0.406) if "dino" in self.model_type else (0.5, 0.5, 0.5)
@@ -62,7 +65,9 @@ class ViTExtractor:
                            vit_base_patch16_224]
         :return: the model
         """
-        if 'dino' in model_type:
+        if 'dinov2' in model_type:
+            model = torch.hub.load('facebookresearch/dinov2', model_type)
+        elif 'dino' in model_type:
             model = torch.hub.load('facebookresearch/dino:main', model_type)
         else:  # model from timm -- load weights from timm to dino model (enables working on arbitrary size images).
             temp_model = timm.create_model(model_type, pretrained=True)
@@ -116,6 +121,32 @@ class ViTExtractor:
         return interpolate_pos_encoding
 
     @staticmethod
+    def _fix_patch_embed():
+        """
+        Creates a method for position encoding interpolation.
+        :param patch_size: patch size of the model.
+        :param stride_hw: A tuple containing the new height and width stride respectively.
+        :return: the interpolation method
+        """
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            _, _, H, W = x.shape
+
+            ## Remove the assertions
+            # patch_H, patch_W = self.patch_size
+            # assert H % patch_H == 0, f"Input image height {H} is not a multiple of patch height {patch_H}"
+            # assert W % patch_W == 0, f"Input image width {W} is not a multiple of patch width: {patch_W}"
+
+            x = self.proj(x)  # B C H W
+            H, W = x.size(2), x.size(3)
+            x = x.flatten(2).transpose(1, 2)  # B HW C
+            x = self.norm(x)
+            if not self.flatten_embedding:
+                x = x.reshape(-1, H, W, self.embed_dim)  # B H W C
+            return x
+
+        return forward
+
+    @staticmethod
     def patch_vit_resolution(model: nn.Module, stride: int) -> nn.Module:
         """
         change resolution of model output by changing the stride of the patch extraction.
@@ -124,6 +155,8 @@ class ViTExtractor:
         :return: the adjusted model
         """
         patch_size = model.patch_embed.patch_size
+        if type(patch_size) == tuple:
+            patch_size = patch_size[0]
         if stride == patch_size:  # nothing to do
             return model
 
@@ -135,6 +168,8 @@ class ViTExtractor:
         model.patch_embed.proj.stride = stride
         # fix the positional encoding code
         model.interpolate_pos_encoding = types.MethodType(ViTExtractor._fix_pos_enc(patch_size, stride), model)
+        # fix the patch embedding
+        model.patch_embed.forward = types.MethodType(ViTExtractor._fix_patch_embed(), model.patch_embed)
         return model
 
     def preprocess(self, image_path: Union[str, Path],
